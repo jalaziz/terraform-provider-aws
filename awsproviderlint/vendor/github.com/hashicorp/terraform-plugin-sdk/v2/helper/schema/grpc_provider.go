@@ -13,7 +13,7 @@ import (
 	"github.com/hashicorp/go-cty/cty/msgpack"
 
 	"github.com/hashicorp/terraform-plugin-go/tfprotov5"
-	"github.com/hashicorp/terraform-plugin-go/tfprotov5/tftypes"
+	"github.com/hashicorp/terraform-plugin-go/tftypes"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/internal/configs/configschema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/internal/configs/hcl2shim"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/internal/plans/objchange"
@@ -282,7 +282,11 @@ func (s *GRPCProviderServer) UpgradeResourceState(ctx context.Context, req *tfpr
 		}
 	// if there's a JSON state, we need to decode it.
 	case len(req.RawState.JSON) > 0:
-		err = json.Unmarshal(req.RawState.JSON, &jsonMap)
+		if res.UseJSONNumber {
+			err = unmarshalJSON(req.RawState.JSON, &jsonMap)
+		} else {
+			err = json.Unmarshal(req.RawState.JSON, &jsonMap)
+		}
 		if err != nil {
 			resp.Diagnostics = convert.AppendProtoDiag(resp.Diagnostics, err)
 			return resp, nil
@@ -405,7 +409,7 @@ func (s *GRPCProviderServer) upgradeFlatmapState(ctx context.Context, version in
 		return nil, 0, err
 	}
 
-	jsonMap, err := StateValueToJSONMap(newConfigVal, schemaType)
+	jsonMap, err := stateValueToJSONMap(newConfigVal, schemaType, res.UseJSONNumber)
 	return jsonMap, upgradedVersion, err
 }
 
@@ -548,6 +552,7 @@ func (s *GRPCProviderServer) ReadResource(ctx context.Context, req *tfprotov5.Re
 		resp.Diagnostics = convert.AppendProtoDiag(resp.Diagnostics, err)
 		return resp, nil
 	}
+	instanceState.RawState = stateVal
 
 	private := make(map[string]interface{})
 	if len(req.Private) > 0 {
@@ -652,11 +657,20 @@ func (s *GRPCProviderServer) PlanResourceChange(ctx context.Context, req *tfprot
 		return resp, nil
 	}
 
+	configVal, err := msgpack.Unmarshal(req.Config.MsgPack, schemaBlock.ImpliedType())
+	if err != nil {
+		resp.Diagnostics = convert.AppendProtoDiag(resp.Diagnostics, err)
+		return resp, nil
+	}
+
 	priorState, err := res.ShimInstanceStateFromValue(priorStateVal)
 	if err != nil {
 		resp.Diagnostics = convert.AppendProtoDiag(resp.Diagnostics, err)
 		return resp, nil
 	}
+	priorState.RawState = priorStateVal
+	priorState.RawPlan = proposedNewStateVal
+	priorState.RawConfig = configVal
 	priorPrivate := make(map[string]interface{})
 	if len(req.PriorPrivate) > 0 {
 		if err := json.Unmarshal(req.PriorPrivate, &priorPrivate); err != nil {
@@ -865,6 +879,12 @@ func (s *GRPCProviderServer) ApplyResourceChange(ctx context.Context, req *tfpro
 		return resp, nil
 	}
 
+	configVal, err := msgpack.Unmarshal(req.Config.MsgPack, schemaBlock.ImpliedType())
+	if err != nil {
+		resp.Diagnostics = convert.AppendProtoDiag(resp.Diagnostics, err)
+		return resp, nil
+	}
+
 	priorState, err := res.ShimInstanceStateFromValue(priorStateVal)
 	if err != nil {
 		resp.Diagnostics = convert.AppendProtoDiag(resp.Diagnostics, err)
@@ -889,9 +909,12 @@ func (s *GRPCProviderServer) ApplyResourceChange(ctx context.Context, req *tfpro
 			Attributes: make(map[string]*terraform.ResourceAttrDiff),
 			Meta:       make(map[string]interface{}),
 			Destroy:    true,
+			RawPlan:    plannedStateVal,
+			RawState:   priorStateVal,
+			RawConfig:  configVal,
 		}
 	} else {
-		diff, err = DiffFromValues(ctx, priorStateVal, plannedStateVal, stripResourceModifiers(res))
+		diff, err = DiffFromValues(ctx, priorStateVal, plannedStateVal, configVal, stripResourceModifiers(res))
 		if err != nil {
 			resp.Diagnostics = convert.AppendProtoDiag(resp.Diagnostics, err)
 			return resp, nil
@@ -902,6 +925,9 @@ func (s *GRPCProviderServer) ApplyResourceChange(ctx context.Context, req *tfpro
 		diff = &terraform.InstanceDiff{
 			Attributes: make(map[string]*terraform.ResourceAttrDiff),
 			Meta:       make(map[string]interface{}),
+			RawPlan:    plannedStateVal,
+			RawState:   priorStateVal,
+			RawConfig:  configVal,
 		}
 	}
 
@@ -1097,6 +1123,8 @@ func (s *GRPCProviderServer) ReadDataSource(ctx context.Context, req *tfprotov5.
 		return resp, nil
 	}
 
+	diff.RawConfig = configVal
+
 	// now we can get the new complete data source
 	newInstanceState, diags := res.ReadDataApply(ctx, diff, s.provider.Meta())
 	resp.Diagnostics = convert.AppendProtoDiag(resp.Diagnostics, diags)
@@ -1148,7 +1176,10 @@ func pathToAttributePath(path cty.Path) *tftypes.AttributePath {
 		}
 	}
 
-	return &tftypes.AttributePath{Steps: steps}
+	if len(steps) < 1 {
+		return nil
+	}
+	return tftypes.NewAttributePathWithSteps(steps)
 }
 
 // helper/schema throws away timeout values from the config and stores them in
